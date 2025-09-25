@@ -1,0 +1,69 @@
+{
+  "full_name": "Student",
+  "profile": "Results-driven candidate with a solid foundation in business administration, finance, and strategic management. Proficient in corporate relations, project management, and data analysis. Skilled in developing strategies that enhance efficiency and drive growth. Adept at building strategic partnerships and understanding market trends. Experienced in financial modeling, market research, and team leadership. Seeking to leverage academic and professional experience to contribute to a dynamic organization.",
+  "contact": {
+    "phone": null,
+    "email": null,
+    "location": "City, Country",
+    "linkedin": null
+  },
+  "skills": [],
+  "tools": [
+    "Tableau",
+    "Power BI",
+    "Microsoft Office",
+    "G-Suite"
+  ],
+  "experience": [
+    {
+      "title": "Creative Intern",
+      "company": "Dentsu Creative",
+      "dates": "April 2024 - Present",
+      "bullets": [
+        "Spearheaded the creation of visually compelling graphics and layouts for marketing news, insights, and case studies, resulting in a 30% increase in social media engagement.",
+        "Successfully collaborated with team members to maintain brand consistency, leading to a 20% growth in audience reach and interaction."
+      ]
+    },
+    {
+      "title": "Social Media Manager",
+      "company": "Hideout Cafe",
+      "dates": "Jan 2024 - Mar 2024",
+      "bullets": [
+        "Devised and implemented a dynamic social media strategy, resulting in a 40% increase in brand visibility and a 25% boost in customer engagement.",
+        "Formulated partnerships with food influencers, resulting in a 50% increase in foot traffic to the cafe and a noticeable rise in sales."
+      ]
+    }
+  ],
+  "education": [],
+  "projects": [
+    {
+      "title": "Micro Consulting Project ( August 2023 )",
+      "description": ""
+    }
+  ],
+  "certifications": [
+    "Fundamentals of Digital Marketing",
+    "Google Analytics Certification",
+    "Business Intelligence",
+    "Behavioral Finance"
+  ],
+  "achievements": [
+    "Monetized YouTube Channel with over 35k views on a single video and 100k overall channel views",
+    "Successfully organized multiple e- sports events in college and for gaming team ( 200+ Participants )",
+    "Conducted consulting-style market research and analysis",
+    "on two companies within the same industry, identifying key challenges and proposing strategic solutions.",
+    "Presented findings to a college audience, showcasing consulting skills and industry insights, and recognized as one of the semi-finalist teams among the top 10."
+  ],
+  "responsibility": [
+    {
+      "role": "Class Representative ( 2023 - Present )",
+      "bullets": [
+        "Oversaw effective communication, student queries, and daily reports, managing a team of 5 and supporting the Core Academic Team with daily reports."
+      ]
+    }
+  ],
+  "activities": [
+    "Terry Fox Marathon of Hope | Volunteer (January 2024 )",
+    "Volunteered for Terry Fox Marathon for Cancer Awareness, actively fundraising and coordinating school participation in marathons."
+  ]
+}
