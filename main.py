@@ -1,264 +1,282 @@
-# resume_parser_fixed_dropin.py
-import re, json
-from docx import Document
+import json
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-HEADINGS = {
-    "FULL NAME": "full_name",
-    "PERSONAL PROFILE": "profile",
-    "CONTACT DETAILS": "contact",
-    "SKILLS AND ABILITIES": "skills",
-    "SOFTWARE/TOOLS": "tools",
-    "INTERNSHIP EXPERIENCE": "experience",
-    "ACADEMIC PROFILE": "education",
-    "PROJECTS": "projects",
-    "CERTIFICATION/COURSES": "certifications",
-    "ACHIEVEMENTS": "achievements",
-    "POSTION OF RESPONSIBILITY": "responsibility",
-    "CO-CURRICULAR ACTIVITIES": "activities",
+# -------------------- Headers & Helpers --------------------
+SECTION_HEADERS = [
+    "PERSONAL PROFILE",
+    "CONTACT DETAILS",
+    "SKILLS AND ABILITIES",
+    "SOFTWARE/TOOLS",
+    "CERTIFICATION/COURSES",
+    "ACHIEVEMENTS",
+    "INTERNSHIP EXPERIENCE",
+    "ACADEMIC PROFILE",
+    "PROJECTS",
+    "POSITION OF RESPONSIBILITY",   # canonical
+    "POSTION OF RESPONSIBILITY",    # common typo -> normalized
+    "CO-CURRICULAR ACTIVITIES",
+]
+
+HEADER_CANON = {
+    "PERSONAL PROFILE": "PERSONAL PROFILE",
+    "CONTACT DETAILS": "CONTACT DETAILS",
+    "SKILLS AND ABILITIES": "SKILLS AND ABILITIES",
+    "SOFTWARE/TOOLS": "SOFTWARE/TOOLS",
+    "CERTIFICATION/COURSES": "CERTIFICATION/COURSES",
+    "ACHIEVEMENTS": "ACHIEVEMENTS",
+    "INTERNSHIP EXPERIENCE": "INTERNSHIP EXPERIENCE",
+    "ACADEMIC PROFILE": "ACADEMIC PROFILE",
+    "PROJECTS": "PROJECTS",
+    "POSITION OF RESPONSIBILITY": "POSITION OF RESPONSIBILITY",
+    "POSTION OF RESPONSIBILITY": "POSITION OF RESPONSIBILITY",  # normalize typo
+    "CO-CURRICULAR ACTIVITIES": "CO-CURRICULAR ACTIVITIES",
 }
 
-# helpers
-def norm(s:str)->str: return (s or "").strip()
-def is_heading(s:str)->str|None:
-    s = norm(s).upper()
-    return s if s in HEADINGS else None
+HEADER_PATTERN = re.compile(
+    r"^\s*(" + "|".join(re.escape(h) for h in SECTION_HEADERS) + r")\s*:?\s*$",
+    flags=re.IGNORECASE
+)
 
-BULLETS = "•-–—▪·◦* \t"
-def clean_bullets(lines):
-    out=[]
-    for t in lines:
-        t = norm(t).lstrip(BULLETS).strip()
-        if t: out.append(t)
-    return out
+EDU_HINTS = re.compile(
+    r"\b(university|college|school|bachelor|master|mba|bba|b\.?tech|m\.?tech|gpa|cgpa|grade|"
+    r"mumbai university|skilltech|semester|january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|’\d{2}|'\d{2}|20\d{2}|19\d{2})\b",
+    flags=re.IGNORECASE
+)
+TOOLS_HINTS = re.compile(
+    r"\b(microsoft|office|excel|word|powerpoint|power bi|tableau|g[ -]?suite|google workspace|"
+    r"sql|python|r\b|jira|confluence|slack|notion|canva|photoshop|illustrator|figma)\b",
+    flags=re.IGNORECASE
+)
+SOFT_SKILL_HINTS = re.compile(
+    r"\b(communication|leadership|teamwork|collaboration|adaptability|flexibility|problem[- ]?solv|"
+    r"conflict|negotiation|networking|relationship|time management|project management)\b",
+    flags=re.IGNORECASE
+)
 
-def split_items(line:str):
-    if any(sep in line for sep in [",",";"]) or re.search(r"\s{2,}", line):
-        return [x.strip() for x in re.split(r"[;,]|\s{2,}", line) if x.strip()]
-    return [line.strip()] if line.strip() else []
+def canon_header(h: str) -> str:
+    h_up = h.strip().upper()
+    return HEADER_CANON.get(h_up, h_up)
 
-# detectors
-RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-RE_LINK  = re.compile(r"(?:https?://\S+|linkedin\.com/\S+|\b@[A-Za-z0-9_-]+)", re.I)
-RE_PHONE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3,5}[\s-]?\d{4}")
-RE_DATE  = re.compile(r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|JULY|JUNE|AUG)[^-\n]*[-–][^-\n]*?(?:Present|Current|Now|'?\d{2,4})", re.I)
-EDU_HINT = re.compile(r"\b(University|College|Institute|Academy|School)\b", re.I)
-DEG_HINT = re.compile(r"\b(MBA|BBA|Bachelor'?s|Master'?s|B\.?Tech|M\.?Tech|PhD|Diploma)\b", re.I)
+def is_header_line(line: str) -> Optional[str]:
+    m = HEADER_PATTERN.match(line.strip())
+    if not m:
+        return None
+    return canon_header(m.group(1))
 
-TOOL_TOKENS = {
-    "microsoft office","office","excel","powerpoint","word",
-    "g-suite","gsuite","google workspace","google sheets","google docs",
-    "tableau","power bi","powerbi","sql","python"
-}
-def looks_tool(s:str)->bool:
-    k = s.lower()
-    return any(tok in k for tok in TOOL_TOKENS)
+def clean_line(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-# column-wise from tables, then paragraphs outside
-def table_columns(tbl):
-    ncols = max(len(r.cells) for r in tbl.rows) if tbl.rows else 0
-    cols = [[] for _ in range(ncols)]
+# -------------------- DOCX Primitives --------------------
+try:
+    from docx import Document
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError as e:
+    raise SystemExit(
+        "Missing dependency: python-docx. Install with:\n  pip install python-docx"
+    ) from e
+
+def iter_block_items(parent) -> Iterable[Union[Paragraph, Table]]:
+    """Yield paragraphs and tables in document order (works for Document and table cells)."""
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+
+    body = getattr(parent.element, "body", None)
+    # If we're inside a table cell
+    if body is None and hasattr(parent, "_tc"):
+        body = parent._tc
+
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+def para_lines(p: Paragraph) -> List[str]:
+    t = clean_line(p.text)
+    return [t] if t else []
+
+def cell_lines(cell: _Cell) -> List[str]:
+    lines: List[str] = []
+    for item in iter_block_items(cell):
+        if isinstance(item, Paragraph):
+            lines.extend(para_lines(item))
+        elif isinstance(item, Table):
+            # Flatten nested tables row-wise
+            lines.extend(flatten_table(item))
+    return lines
+
+def flatten_table(tbl: Table) -> List[str]:
+    lines: List[str] = []
     for row in tbl.rows:
-        for ci, cell in enumerate(row.cells):
-            for p in cell.paragraphs:
-                t = norm(p.text)
-                if t:
-                    cols[ci].append(t)
-    return cols
+        row_cells = [clean_line(cell_text) for cell_text in (cell_lines(c) for c in row.cells)]
+        # cell_lines returns list; flatten per cell then join
+        row_flat: List[str] = []
+        for per_cell in row_cells:
+            if isinstance(per_cell, list):  # already lines
+                joined = " ".join(per_cell).strip()
+                if joined:
+                    row_flat.append(joined)
+            else:
+                if per_cell:
+                    row_flat.append(str(per_cell).strip())
+        if row_flat:
+            lines.append(" | ".join([x for x in row_flat if x]))
+    return lines
 
-def bucket_column(lines):
-    buckets, cur = {}, None
-    for ln in lines:
-        h = is_heading(ln)
+# -------------------- Main Extraction --------------------
+def docx_to_sections_live(doc_path: Union[str, Path]) -> Dict[str, List[str]]:
+    """
+    Single-pass: walk paragraphs and tables; detect headers as they appear;
+    assign subsequent lines to the current section until the next header.
+    Each 2-column table is processed row-by-row (left→right) and NOT merged
+    with the next table, avoiding cross-table bleed.
+    """
+    doc = Document(str(doc_path))
+    sections: Dict[str, List[str]] = defaultdict(list)
+    current: Optional[str] = None
+    unsectioned: List[str] = []
+
+    def commit_line(line: str):
+        nonlocal current
+        h = is_header_line(line)
         if h:
-            cur = HEADINGS[h]
-            buckets.setdefault(cur, [])
-            continue
-        if cur:
-            buckets[cur].append(ln)
-    return buckets
+            current = h
+            # Don’t store the header itself
+            return
+        if current:
+            sections[current].append(line)
+        else:
+            unsectioned.append(line)
 
-def parse_docx_by_columns(path:str)->dict:
-    doc = Document(path)
-    per_col = []
+    for block in iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            for ln in para_lines(block):
+                commit_line(ln)
 
-    # tables as columns
-    for tbl in doc.tables:
-        for ci, col_lines in enumerate(table_columns(tbl)):
-            if not col_lines: continue
-            b = bucket_column(col_lines)
-            if not b: continue
-            while len(per_col) <= ci:
-                per_col.append({})
-            for k,v in b.items():
-                per_col[ci].setdefault(k, []).extend(v)
+        elif isinstance(block, Table):
+            # Heuristic: treat as two-column if all rows have 2 cells
+            col_counts = {len(r.cells) for r in block.rows} if block.rows else set()
+            is_two_col = (len(col_counts) == 1 and next(iter(col_counts), 0) == 2)
+            if is_two_col:
+                for row in block.rows:
+                    # Process left then right so headers in each column are recognized in order
+                    for cell in row.cells:
+                        for ln in cell_lines(cell):
+                            commit_line(ln)
+            else:
+                # Generic table: read row-wise
+                for ln in flatten_table(block):
+                    commit_line(ln)
 
-    # paragraphs outside tables → extra column
-    outside_lines = [norm(p.text) for p in doc.paragraphs if norm(p.text)]
-    out_b = bucket_column(outside_lines)
-    if out_b:
-        per_col.append(out_b)
+    # Attach any unsectioned lines as FULL_TEXT (fallback)
+    if unsectioned:
+        sections["FULL_TEXT"] = unsectioned
 
-    # final structure
-    out = {
-        "full_name": None,
-        "profile": "",
-        "contact": {"phone": None, "email": None, "location": None, "linkedin": None},
-        "skills": [],
-        "tools": [],
-        "experience": [],
-        "education": [],
-        "projects": [],
-        "certifications": [],
-        "achievements": [],
-        "responsibility": [],
-        "activities": [],
-    }
+    return sections
 
-    # merge columns carefully
-    for col in per_col:
-        if not out["full_name"] and col.get("full_name"):
-            out["full_name"] = " ".join(col["full_name"]).strip()
-        if not out["profile"] and col.get("profile"):
-            out["profile"] = " ".join(col["profile"]).strip()
+# -------------------- Repair / Normalization --------------------
+def repair_sections(sections: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """
+    Fix common misfiled content based on simple, conservative heuristics:
+      - Move education-ish lines out of SOFTWARE/TOOLS into ACADEMIC PROFILE.
+      - Move soft-skill lines out of ACADEMIC PROFILE into SKILLS AND ABILITIES.
+    """
+    def move_matching(src_key: str, dst_key: str, pattern: re.Pattern):
+        src = sections.get(src_key, [])
+        keep, move = [], []
+        for ln in src:
+            if pattern.search(ln):
+                move.append(ln)
+            else:
+                keep.append(ln)
+        if move:
+            sections[src_key] = keep
+            sections[dst_key] = sections.get(dst_key, []) + move
 
-        # CONTACT: fix location+linkedin on one line
-        if col.get("contact"):
-            lines = col["contact"]
-            blob = " | ".join(lines)
-            if not out["contact"]["email"]:
-                m = RE_EMAIL.search(blob);  out["contact"]["email"] = m.group(0) if m else None
-            if not out["contact"]["phone"]:
-                m = RE_PHONE.search(blob);  out["contact"]["phone"] = m.group(0) if m else None
-            if not out["contact"]["linkedin"]:
-                m = RE_LINK.search(blob);   out["contact"]["linkedin"] = m.group(0) if m else None
-            for ln in lines:
-                low = ln.lower()
-                if "current location" in low:
-                    # split if LinkedIn text is stuck to it
-                    before = ln.split("LinkedIn",1)[0]
-                    loc = before.split(":",1)[-1].strip()
-                    if loc: out["contact"]["location"] = loc
+    # 1) Tools should not contain schools/degrees/dates
+    move_matching("SOFTWARE/TOOLS", "ACADEMIC PROFILE", EDU_HINTS)
 
-        # SKILLS & TOOLS (exclude edu-looking items)
-        for key, target in [("skills","skills"), ("tools","tools")]:
-            if col.get(key):
-                for ln in clean_bullets(col[key]):
-                    for item in split_items(ln):
-                        if not item: continue
-                        if EDU_HINT.search(item) or DEG_HINT.search(item):
-                            # never allow edu lines into skills/tools
-                            continue
-                        (out[target]).append(item)
+    # 2) Academic Profile should not contain generic soft skills
+    move_matching("ACADEMIC PROFILE", "SKILLS AND ABILITIES", SOFT_SKILL_HINTS)
 
-        # EXPERIENCE → structured jobs
-        if col.get("experience"):
-            lines = [ln for ln in col["experience"] if ln.strip()]
-            # split blocks on empty line OR a new role line (heuristic for your template)
-            blocks, cur = [], []
-            for ln in lines + [""]:
-                if not ln.strip():
-                    if cur: blocks.append(cur); cur=[]
-                    continue
-                # heuristic: lines that look like a new role (capitalize words, shortish)
-                if cur and (("|" in ln) or re.match(r"^[A-Z][A-Za-z\s]+$", ln) and len(ln) <= 40):
-                    # if current already has a company|dates line earlier, start new block
-                    if any("|" in x for x in cur[1:]):
-                        blocks.append(cur); cur=[ln]; continue
-                cur.append(ln)
-            if cur: blocks.append(cur)
+    # 3) If SKILLS is still empty but ACADEMIC PROFILE looks 80% skills, move all
+    skills = sections.get("SKILLS AND ABILITIES", [])
+    acad = sections.get("ACADEMIC PROFILE", [])
+    if not skills and acad:
+        hits = sum(1 for ln in acad if SOFT_SKILL_HINTS.search(ln) and not EDU_HINTS.search(ln))
+        if hits >= max(1, int(0.8 * len(acad))):
+            sections["SKILLS AND ABILITIES"] = acad
+            sections["ACADEMIC PROFILE"] = []
 
-            for bl in blocks:
-                title = bl[0] if bl else None
-                company, dates, rest = None, None, bl[1:]
-                # find the first 'Company | dates' line
-                for i, l in enumerate(rest):
-                    if "|" in l:
-                        parts = [x.strip() for x in l.split("|",1)]
-                        if len(parts)==2:
-                            company, dates = parts
-                            rest = rest[i+1:]
-                            break
-                bullets = clean_bullets(rest)
-                out["experience"].append({"title": title, "company": company, "dates": dates, "bullets": bullets})
+    # Strip empty sections
+    for k in list(sections.keys()):
+        sections[k] = [ln for ln in sections[k] if clean_line(ln)]
+        if not sections[k]:
+            # keep the key but as empty list (up to you). We’ll keep it for visibility.
+            pass
 
-        # EDUCATION → (institution, degree, dates) in order
-        if col.get("education"):
-            edu_lines = [ln for ln in col["education"] if ln.strip()]
-            pending = {"institution": None, "degree": None, "dates": None}
-            def flush():
-                if pending["institution"] or pending["degree"] or pending["dates"]:
-                    out["education"].append(pending.copy())
-                pending.update({"institution": None, "degree": None, "dates": None})
+    return sections
 
-            for ln in edu_lines:
-                if EDU_HINT.search(ln):
-                    flush()
-                    pending["institution"] = ln.strip()
-                    continue
-                if DEG_HINT.search(ln):
-                    pending["degree"] = ln.strip()
-                    continue
-                m = RE_DATE.search(ln)
-                if m:
-                    pending["dates"] = m.group(0).strip()
-                    continue
-            flush()
+# -------------------- Public API --------------------
+def docx_resume_to_json(docx_path: Union[str, Path]) -> Dict[str, str]:
+    """
+    Read a .docx resume and return a dict of {SECTION: "joined text"}.
+    Always returns valid JSON-serializable data.
+    """
+    p = Path(docx_path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
 
-        # PROJECTS: strip dates/tools from description
-        if col.get("projects"):
-            pr = col["projects"]
-            title = pr[0]
-            desc_lines = clean_bullets(pr[1:])
-            cleaned=[]
-            for s in desc_lines:
-                if RE_DATE.search(s):
-                    continue
-                if looks_tool(s) or any(tok in s.lower() for tok in ["tableau","power bi","powerbi"]):
-                    for it in split_items(s):
-                        if it and it not in out["tools"]:
-                            out["tools"].append(it)
-                    continue
-                cleaned.append(s)
-            out["projects"].append({"title": title, "description": " ".join(cleaned)})
+    raw_sections = docx_to_sections_live(p)
+    fixed_sections = repair_sections(raw_sections)
 
-        # Simple lists
-        if col.get("certifications"):
-            for ln in clean_bullets(col["certifications"]):
-                out["certifications"].extend(split_items(ln))
-        if col.get("achievements"):
-            out["achievements"].extend(clean_bullets(col["achievements"]))
-        if col.get("activities"):
-            out["activities"].extend(clean_bullets(col["activities"]))
-        if col.get("responsibility"):
-            rl = col["responsibility"]
-            role = rl[0]
-            bullets = clean_bullets(rl[1:])
-            # merge wrapped bullet like "... team of" + "5 and ..."
-            merged=[]
-            for b in bullets:
-                if merged and merged[-1].lower().endswith(" of"):
-                    merged[-1] = merged[-1] + " " + b
-                else:
-                    merged.append(b)
-            out["responsibility"].append({"role": role, "bullets": merged})
-
-    # tidy
-    out["skills"] = list(dict.fromkeys([s for s in out["skills"] if s]))
-    out["tools"]  = list(dict.fromkeys([t for t in out["tools"] if t]))
-    if "Microsoft Office G-Suite" in out["tools"]:
-        out["tools"].remove("Microsoft Office G-Suite")
-        for t in ["Microsoft Office","G-Suite"]:
-            if t not in out["tools"]: out["tools"].append(t)
-
-    # drop empty/partial education rows
-    out["education"] = [e for e in out["education"] if e["institution"] or e["degree"] or e["dates"]]
+    # Normalize header keys to canonical form and join lines
+    out: Dict[str, str] = {}
+    for k, lines in fixed_sections.items():
+        canon = canon_header(k)
+        # Join with newlines (preserve bullet/line structure)
+        out[canon] = "\n".join(lines).strip()
 
     return out
 
+# -------------------- CLI --------------------
 if __name__ == "__main__":
-    infile  = "Resume_Template.docx"   # your file
-    outfile = "parsed_resume.json"
-    data = parse_docx_by_columns(infile)
-    with open(outfile, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    print("✅ Parsed →", outfile)
+    import sys
+    from pathlib import Path
+
+    # Prefer CWD, then script folder
+    candidates = [
+        Path.cwd() / "Resume_Template.docx",
+        Path(__file__).resolve().parent / "Resume_Template.docx",
+    ]
+
+    docx_path = next((p for p in candidates if p.exists()), None)
+    if not docx_path:
+        raise SystemExit(
+            "Resume_Template.docx not found.\n"
+            "Place it in the current working directory or next to this script."
+        )
+
+    out_path = docx_path.with_suffix(".json")
+
+    try:
+        data = docx_resume_to_json(docx_path)
+    except Exception as e:
+        # Make any failure obvious and actionable
+        raise SystemExit(f"Failed to convert '{docx_path.name}': {e}") from e
+
+    try:
+        import json
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise SystemExit(f"Could not write JSON to '{out_path}': {e}") from e
+
+    print(f"Saved JSON to: {out_path}")
