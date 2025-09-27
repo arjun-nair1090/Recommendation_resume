@@ -1,10 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Union
 
-# -------------------- Headers & Helpers --------------------
+# ==================== Section Headers & Patterns ====================
+
 SECTION_HEADERS = [
     "PERSONAL PROFILE",
     "CONTACT DETAILS",
@@ -40,29 +44,47 @@ HEADER_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 
+# Hints used in the repair step
 EDU_HINTS = re.compile(
-    r"\b(university|college|school|bachelor|master|mba|bba|b\.?tech|m\.?tech|gpa|cgpa|grade|"
-    r"mumbai university|skilltech|semester|january|february|march|april|may|june|july|august|"
-    r"september|october|november|december|’\d{2}|'\d{2}|20\d{2}|19\d{2})\b",
+    r"\b(university|college|school|bachelor|master|mba|bba|gpa|cgpa|grade|"
+    r"semester|campus|institute|degree|diploma|"
+    r"mumbai university|atlas skilltech|"
+    r"january|february|march|april|may|june|july|august|september|october|november|december|"
+    r"’\d{2}|'?\d{2}|20\d{2}|19\d{2})\b",
     flags=re.IGNORECASE
 )
+
 TOOLS_HINTS = re.compile(
-    r"\b(microsoft|office|excel|word|powerpoint|power bi|tableau|g[ -]?suite|google workspace|"
-    r"sql|python|r\b|jira|confluence|slack|notion|canva|photoshop|illustrator|figma)\b",
+    r"\b(microsoft(?: office)?|excel|word|powerpoint|power\s*bi|tableau|g[ -]?suite|google analytics|"
+    r"sql|python|r\b|jira|confluence|notion|slack|figma|canva|photoshop|illustrator)\b",
     flags=re.IGNORECASE
 )
+
 SOFT_SKILL_HINTS = re.compile(
     r"\b(communication|leadership|teamwork|collaboration|adaptability|flexibility|problem[- ]?solv|"
     r"conflict|negotiation|networking|relationship|time management|project management)\b",
     flags=re.IGNORECASE
 )
 
+FANCY_APOST = re.compile(r"[\u2019\u2018]")  # ’ ‘
+MONTH_WORDS = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)"
+DATE_RANGE_RE = re.compile(rf"\b{MONTH_WORDS}\b.*\b\d{{2,4}}\b.*?-.*?\b{MONTH_WORDS}\b.*\b\d{{2,4}}\b", re.IGNORECASE)
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+DEGREE_HINTS = re.compile(
+    r"\b(mba|master(?:'s)? of business administration|masters of business administration|"
+    r"bba|b\.?ba|b\.?tech|m\.?tech|bsc|msc|ba|ma|"
+    r"bachelor(?:'s)?|master(?:'s)?|degree|diploma)\b",
+    re.IGNORECASE
+)
+GENERIC_NAME_LINES = re.compile(r"^(full\s*name|student|resume)$", re.IGNORECASE)
+
+# ==================== Helpers ====================
+
 def canon_header(h: str) -> str:
-    h_up = h.strip().upper()
-    return HEADER_CANON.get(h_up, h_up)
+    return HEADER_CANON.get(h.strip().upper(), h.strip().upper())
 
 def is_header_line(line: str) -> Optional[str]:
-    m = HEADER_PATTERN.match(line.strip())
+    m = HEADER_PATTERN.match((line or "").strip())
     if not m:
         return None
     return canon_header(m.group(1))
@@ -72,27 +94,53 @@ def clean_line(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-# -------------------- DOCX Primitives --------------------
+def normalize_line(s: str) -> str:
+    s = s or ""
+    s = FANCY_APOST.sub("'", s)
+    s = s.replace("DURATIONR", "DURATION")  # fix common typo
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def is_tools_only(line: str) -> bool:
+    return bool(TOOLS_HINTS.search(line)) and not (EDU_HINTS.search(line) or DEGREE_HINTS.search(line))
+
+def is_degreeish(line: str) -> bool:
+    return bool(DEGREE_HINTS.search(line) or EDU_HINTS.search(line))
+
+def is_dateish(line: str) -> bool:
+    l = FANCY_APOST.sub("'", line or "")
+    return bool(DATE_RANGE_RE.search(l) or YEAR_RE.search(l) or "DURATION" in l.upper())
+
+def dedupe_preserve_order(lines: List[str]) -> List[str]:
+    seen, out = set(), []
+    for ln in lines:
+        key = ln.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(ln)
+    return out
+
+# ==================== DOCX Reading ====================
+
 try:
     from docx import Document
     from docx.table import _Cell, Table
     from docx.text.paragraph import Paragraph
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
 except ImportError as e:
     raise SystemExit(
-        "Missing dependency: python-docx. Install with:\n  pip install python-docx"
+        "Missing dependency: python-docx.\nInstall with: pip install python-docx"
     ) from e
 
 def iter_block_items(parent) -> Iterable[Union[Paragraph, Table]]:
-    """Yield paragraphs and tables in document order (works for Document and table cells)."""
-    from docx.oxml.table import CT_Tbl
-    from docx.oxml.text.paragraph import CT_P
+    """Yield paragraphs and tables in document order (Document or table cell)."""
+    if isinstance(parent, _Cell):
+        parent_elm = parent._tc
+    else:
+        parent_elm = parent.element.body
 
-    body = getattr(parent.element, "body", None)
-    # If we're inside a table cell
-    if body is None and hasattr(parent, "_tc"):
-        body = parent._tc
-
-    for child in body.iterchildren():
+    for child in parent_elm.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, parent)
         elif isinstance(child, CT_Tbl):
@@ -102,41 +150,32 @@ def para_lines(p: Paragraph) -> List[str]:
     t = clean_line(p.text)
     return [t] if t else []
 
-def cell_lines(cell: _Cell) -> List[str]:
+def cell_to_lines(cell: _Cell) -> List[str]:
     lines: List[str] = []
     for item in iter_block_items(cell):
         if isinstance(item, Paragraph):
             lines.extend(para_lines(item))
         elif isinstance(item, Table):
-            # Flatten nested tables row-wise
-            lines.extend(flatten_table(item))
+            lines.extend(table_iter_lines(item))  # nested table
     return lines
 
-def flatten_table(tbl: Table) -> List[str]:
+def table_iter_lines(tbl: Table) -> List[str]:
+    """
+    Return lines by reading the table row-wise and cell-wise.
+    This preserves left→right order (good for 2-column resumes).
+    """
     lines: List[str] = []
     for row in tbl.rows:
-        row_cells = [clean_line(cell_text) for cell_text in (cell_lines(c) for c in row.cells)]
-        # cell_lines returns list; flatten per cell then join
-        row_flat: List[str] = []
-        for per_cell in row_cells:
-            if isinstance(per_cell, list):  # already lines
-                joined = " ".join(per_cell).strip()
-                if joined:
-                    row_flat.append(joined)
-            else:
-                if per_cell:
-                    row_flat.append(str(per_cell).strip())
-        if row_flat:
-            lines.append(" | ".join([x for x in row_flat if x]))
+        for cell in row.cells:
+            lines.extend(cell_to_lines(cell))
     return lines
 
-# -------------------- Main Extraction --------------------
+# ==================== Core Extraction ====================
+
 def docx_to_sections_live(doc_path: Union[str, Path]) -> Dict[str, List[str]]:
     """
-    Single-pass: walk paragraphs and tables; detect headers as they appear;
-    assign subsequent lines to the current section until the next header.
-    Each 2-column table is processed row-by-row (left→right) and NOT merged
-    with the next table, avoiding cross-table bleed.
+    Single-pass parse: detect headers as they appear; assign subsequent lines
+    to that section until the next header. Works across paragraphs and tables.
     """
     doc = Document(str(doc_path))
     sections: Dict[str, List[str]] = defaultdict(list)
@@ -145,10 +184,11 @@ def docx_to_sections_live(doc_path: Union[str, Path]) -> Dict[str, List[str]]:
 
     def commit_line(line: str):
         nonlocal current
+        if not line:
+            return
         h = is_header_line(line)
         if h:
-            current = h
-            # Don’t store the header itself
+            current = h  # don't store the header itself
             return
         if current:
             sections[current].append(line)
@@ -159,76 +199,95 @@ def docx_to_sections_live(doc_path: Union[str, Path]) -> Dict[str, List[str]]:
         if isinstance(block, Paragraph):
             for ln in para_lines(block):
                 commit_line(ln)
-
         elif isinstance(block, Table):
-            # Heuristic: treat as two-column if all rows have 2 cells
-            col_counts = {len(r.cells) for r in block.rows} if block.rows else set()
-            is_two_col = (len(col_counts) == 1 and next(iter(col_counts), 0) == 2)
-            if is_two_col:
-                for row in block.rows:
-                    # Process left then right so headers in each column are recognized in order
-                    for cell in row.cells:
-                        for ln in cell_lines(cell):
-                            commit_line(ln)
-            else:
-                # Generic table: read row-wise
-                for ln in flatten_table(block):
-                    commit_line(ln)
+            for ln in table_iter_lines(block):
+                commit_line(ln)
 
-    # Attach any unsectioned lines as FULL_TEXT (fallback)
     if unsectioned:
         sections["FULL_TEXT"] = unsectioned
 
     return sections
 
-# -------------------- Repair / Normalization --------------------
+# ==================== Repair / Normalization ====================
+
 def repair_sections(sections: Dict[str, List[str]]) -> Dict[str, List[str]]:
     """
-    Fix common misfiled content based on simple, conservative heuristics:
-      - Move education-ish lines out of SOFTWARE/TOOLS into ACADEMIC PROFILE.
-      - Move soft-skill lines out of ACADEMIC PROFILE into SKILLS AND ABILITIES.
+    Strong repair:
+      - Keep tools in SOFTWARE/TOOLS; move degrees/dates to ACADEMIC PROFILE.
+      - PROJECTS: move tool-only lines to SOFTWARE/TOOLS; date-ish to ACADEMIC PROFILE.
+      - Move soft-skill lines from ACADEMIC PROFILE to SKILLS AND ABILITIES.
+      - Clean FULL_TEXT placeholders.
+      - Normalize whitespace, dedupe, keep order.
     """
-    def move_matching(src_key: str, dst_key: str, pattern: re.Pattern):
-        src = sections.get(src_key, [])
-        keep, move = [], []
-        for ln in src:
-            if pattern.search(ln):
-                move.append(ln)
-            else:
-                keep.append(ln)
-        if move:
-            sections[src_key] = keep
-            sections[dst_key] = sections.get(dst_key, []) + move
-
-    # 1) Tools should not contain schools/degrees/dates
-    move_matching("SOFTWARE/TOOLS", "ACADEMIC PROFILE", EDU_HINTS)
-
-    # 2) Academic Profile should not contain generic soft skills
-    move_matching("ACADEMIC PROFILE", "SKILLS AND ABILITIES", SOFT_SKILL_HINTS)
-
-    # 3) If SKILLS is still empty but ACADEMIC PROFILE looks 80% skills, move all
-    skills = sections.get("SKILLS AND ABILITIES", [])
-    acad = sections.get("ACADEMIC PROFILE", [])
-    if not skills and acad:
-        hits = sum(1 for ln in acad if SOFT_SKILL_HINTS.search(ln) and not EDU_HINTS.search(ln))
-        if hits >= max(1, int(0.8 * len(acad))):
-            sections["SKILLS AND ABILITIES"] = acad
-            sections["ACADEMIC PROFILE"] = []
-
-    # Strip empty sections
+    # Normalize every line first
     for k in list(sections.keys()):
-        sections[k] = [ln for ln in sections[k] if clean_line(ln)]
-        if not sections[k]:
-            # keep the key but as empty list (up to you). We’ll keep it for visibility.
-            pass
+        sections[k] = [normalize_line(ln) for ln in sections.get(k, []) if normalize_line(ln)]
+
+    # SOFTWARE/TOOLS: keep tools; move degree/date-ish to academic
+    tools = sections.get("SOFTWARE/TOOLS", [])
+    keep_tools, to_acad = [], []
+    for ln in tools:
+        if is_degreeish(ln) or is_dateish(ln):
+            to_acad.append(ln)
+        else:
+            keep_tools.append(ln)
+    sections["SOFTWARE/TOOLS"] = keep_tools
+
+    # PROJECTS: move tool-only lines to tools; date-ish to academic (unless explicitly a "PROJECT" line)
+    projs = sections.get("PROJECTS", [])
+    proj_keep, proj_to_tools, proj_to_acad = [], [], []
+    for ln in projs:
+        if is_tools_only(ln):
+            proj_to_tools.append(ln)
+        elif is_dateish(ln) and "PROJECT" not in ln.upper():
+            proj_to_acad.append(ln)
+        else:
+            proj_keep.append(ln)
+    sections["PROJECTS"] = proj_keep
+
+    # Consolidate moves
+    acad = sections.get("ACADEMIC PROFILE", [])
+    acad.extend(to_acad)
+    acad.extend(proj_to_acad)
+    sections["ACADEMIC PROFILE"] = acad
+
+    sw = sections.get("SOFTWARE/TOOLS", [])
+    sw.extend(proj_to_tools)
+    sections["SOFTWARE/TOOLS"] = sw
+
+    # ACADEMIC PROFILE: move soft skills to SKILLS AND ABILITIES
+    acad = sections.get("ACADEMIC PROFILE", [])
+    acad_keep, to_skills = [], []
+    for ln in acad:
+        if SOFT_SKILL_HINTS.search(ln) and not is_degreeish(ln):
+            to_skills.append(ln)
+        else:
+            acad_keep.append(ln)
+    sections["ACADEMIC PROFILE"] = acad_keep
+
+    skills = sections.get("SKILLS AND ABILITIES", [])
+    skills.extend(to_skills)
+    sections["SKILLS AND ABILITIES"] = skills
+
+    # FULL_TEXT: drop placeholder junk like "FULL NAME", "Student", "Resume"
+    ft = [ln for ln in sections.get("FULL_TEXT", []) if not GENERIC_NAME_LINES.match(ln)]
+    if ft:
+        sections["FULL_TEXT"] = ft
+    else:
+        sections.pop("FULL_TEXT", None)
+
+    # Deduplicate & strip empties (preserve keys, but contents cleaned)
+    for k in list(sections.keys()):
+        sections[k] = dedupe_preserve_order([ln for ln in sections[k] if ln.strip()])
 
     return sections
 
-# -------------------- Public API --------------------
+# ==================== Public API ====================
+
 def docx_resume_to_json(docx_path: Union[str, Path]) -> Dict[str, str]:
     """
     Read a .docx resume and return a dict of {SECTION: "joined text"}.
-    Always returns valid JSON-serializable data.
+    If no headers are found, you'll get {"FULL_TEXT": "..."}.
     """
     p = Path(docx_path)
     if not p.exists():
@@ -241,22 +300,17 @@ def docx_resume_to_json(docx_path: Union[str, Path]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for k, lines in fixed_sections.items():
         canon = canon_header(k)
-        # Join with newlines (preserve bullet/line structure)
         out[canon] = "\n".join(lines).strip()
-
     return out
 
-# -------------------- CLI --------------------
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
+# ==================== Main (Auto-input: Resume_Template.docx) ====================
 
-    # Prefer CWD, then script folder
+if __name__ == "__main__":
+    # Locate Resume_Template.docx in CWD, else next to this script
     candidates = [
         Path.cwd() / "Resume_Template.docx",
         Path(__file__).resolve().parent / "Resume_Template.docx",
     ]
-
     docx_path = next((p for p in candidates if p.exists()), None)
     if not docx_path:
         raise SystemExit(
@@ -269,11 +323,9 @@ if __name__ == "__main__":
     try:
         data = docx_resume_to_json(docx_path)
     except Exception as e:
-        # Make any failure obvious and actionable
         raise SystemExit(f"Failed to convert '{docx_path.name}': {e}") from e
 
     try:
-        import json
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
